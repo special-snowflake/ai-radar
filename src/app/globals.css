@@ -1,0 +1,234 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #04060c;
+  --color-ink-900: #080b14;
+  --color-ink-850: #0b0f1b;
+  --color-ink-800: #111726;
+  --color-ink-700: #1b2334;
+  --color-radar-100: #e6edff;
+  --color-radar-300: #a5b8ff;
+  --color-radar-400: #7c8cff;
+  --color-radar-500: #5b6cff;
+  --color-signal-400: #34d399;
+  --color-alert-400: #fb7185;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 12% -8%, rgba(91, 108, 255, 0.16), transparent 60%),
+    radial-gradient(900px 500px at 92% 4%, rgba(52, 211, 153, 0.1), transparent 55%),
+    var(--color-ink-950);
+  color: var(--color-radar-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(124, 140, 255, 0.35);
+}
+
+/* --- surfaces ------------------------------------------------------------ */
+
+.panel {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 16px;
+  backdrop-filter: blur(6px);
+}
+
+.panel-tight {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 12px;
+}
+
+.panel-hover {
+  transition: border-color 140ms ease, transform 140ms ease, background 140ms ease;
+}
+
+.panel-hover:hover {
+  border-color: rgba(124, 140, 255, 0.5);
+  background: linear-gradient(180deg, rgba(124, 140, 255, 0.08), rgba(255, 255, 255, 0.02));
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.chip-active {
+  border-color: rgba(124, 140, 255, 0.7);
+  background: rgba(124, 140, 255, 0.16);
+  color: #eef2ff;
+}
+
+.input {
+  background: rgba(4, 6, 12, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 0.55rem 0.75rem;
+  color: var(--color-radar-100);
+  font-size: 0.875rem;
+  width: 100%;
+}
+
+.input:focus {
+  outline: 2px solid rgba(124, 140, 255, 0.5);
+  outline-offset: 1px;
+  border-color: rgba(124, 140, 255, 0.6);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border-radius: 10px;
+  padding: 0.5rem 0.85rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--color-radar-100);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(124, 140, 255, 0.5);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, #6d7cff, #4f5fe6);
+  border-color: rgba(124, 140, 255, 0.6);
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #7d8bff, #5a69ef);
+}
+
+/* --- animation ----------------------------------------------------------- */
+
+@keyframes radar-ping {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.radar-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-signal-400);
+}
+
+.radar-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--color-signal-400);
+  animation: radar-ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.radar-dot-idle {
+  background: #64748b;
+}
+
+.radar-dot-idle::after {
+  background: #64748b;
+  animation: none;
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+.sweep-bar {
+  position: relative;
+  overflow: hidden;
+}
+
+.sweep-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(124, 140, 255, 0.55), transparent);
+  animation: sweep 1.4s linear infinite;
+}
+
+/* --- scrollbars ---------------------------------------------------------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.line-clamp-2-custom {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.line-clamp-3-custom {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
