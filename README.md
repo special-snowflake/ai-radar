@@ -98,6 +98,10 @@ silently losing writes.
 | `BLOB_STORE_PATHNAME` | `news.json` | Document path inside the Blob store |
 | `BLOB_ACCESS` | `public` | Must match the Blob store access mode: `public` or `private` |
 | `DATA_DIR` | `./data` | Directory holding `db.json` + the seed snapshot (local backend) |
+| `STORE_WRITE_ATTEMPTS` | `5` | Conditional-write attempts per flush, including the first |
+| `STORE_WRITE_BACKOFF_MS` | `150` | Base backoff before the second attempt; doubles per attempt, jittered |
+| `STORE_WRITE_BACKOFF_MAX_MS` | `2000` | Upper bound for a single backoff delay |
+| `STORE_WRITE_DEADLINE_MS` | `5000` | Wall-clock budget for retries before the durable fallback runs |
 | `MAX_ARTICLES`, `SEED_ON_EMPTY`, `SCAN_*`, `ENABLE_SCHEDULER`, `SUMMARIZER`, `OPENAI_*` | see `.env.example` | Scanner, store window and summarizer settings |
 
 Secrets are never hard-coded and `.env*` files are git-ignored. Start from
@@ -111,8 +115,25 @@ compare-and-swap loop:
 1. check the stored version (local: file size + mtime, Blob: ETag),
 2. if another writer moved the document on, re-read it and replay the pending
    changes on top,
-3. write conditionally (`ifMatch` on Vercel Blob, version check on the file) and
-   retry on a lost race (up to 3 attempts).
+3. write conditionally (`ifMatch` on Vercel Blob, version check on the file),
+4. on a lost race, wait out an **exponential backoff with jitter** and retry
+   (`STORE_WRITE_ATTEMPTS`, `STORE_WRITE_BACKOFF_MS`,
+   `STORE_WRITE_BACKOFF_MAX_MS`, bounded by `STORE_WRITE_DEADLINE_MS`),
+5. if the budget is exhausted, the change set is written to a **durable pending
+   record** next to the document — `news.pending-<id>.json` in Blob,
+   `data/db.json.pending-<id>.json` locally — before `flush()` returns.
+
+Jitter matters more than the delay itself: writers that retry immediately stay
+in lockstep and lose the same race over and over, which is what produced
+endless "changed since it was read; rebasing 83 local change(s)" lines.
+
+Step 5 is the part that makes a give-up safe. A serverless instance is
+recycled without warning, so a change set that only exists in process memory is
+a silent data-loss risk; the pending record survives the process. Records are
+merged back in on the next `ensureStoreLoaded()` (three-way merge of the stored
+document, the base the changes were applied to, and the change set itself —
+`src/lib/storage/merge.ts`) and deleted once the merged document is stored.
+Repeated give-ups refresh the same record instead of piling up one per flush.
 
 That prevents the classic read-modify-write loss where two writers each load the
 document, each add their own change, and the slower one overwrites the other. It
@@ -121,12 +142,21 @@ instances, and the manual "Scan now" button (which reuses the in-flight sweep).
 
 Known limitations, documented rather than hidden:
 
+* Neither backend offers an atomic merge, so retries and a pending record are
+  the ceiling of this design: a change set that is *durable* but not yet stored
+  waits for the next hydrate of any instance. A KV/Redis lock around the write,
+  or a store with real transactions (Postgres/KV), is the long-term answer if
+  the write rate ever grows from "a scan every 20 minutes plus UI clicks" to a
+  high-frequency multi-writer workload.
 * An in-process cache can be a few seconds stale in another instance; the store
   rebases on the next write, so no update is lost, but a read may briefly miss
   the newest articles.
 * Mutating routes respond only after `await flush()`, so the change is on the
   backend before the response is sent. A request already in flight when a
-  serverless instance is frozen can still lose its very last write.
+  serverless instance is frozen still leaves its change set in process memory —
+  it is written durably on the next attempt of that instance, but if the
+  instance dies first the change is lost (no backend can complete a write that
+  never reaches it).
 * `ENABLE_SCHEDULER` runs a scan loop inside the server process. That is ideal
   for local development and long-lived Node servers, but on serverless every
   instance would run its own loop. For Vercel, disable it and drive the existing
@@ -152,7 +182,19 @@ Known limitations, documented rather than hidden:
     "dirty": false,
     "pendingWrites": 0,
     "lastWriteAt": "2026-01-01T10:00:00.000Z",
-    "lastError": null
+    "lastError": null,
+    "contention": {
+      "writes": 42,
+      "contended": 3,
+      "conflicts": 5,
+      "contentionRetries": 6,
+      "giveUps": 0,
+      "fallbacksWritten": 0,
+      "fallbacksRecovered": 0,
+      "pendingFallbacks": 0,
+      "lastGiveUpAt": null,
+      "maxAttemptsUsed": 3
+    }
   }
 }
 ```
@@ -162,6 +204,25 @@ When the backend cannot be loaded the endpoint answers `503` with
 a network failure or an unreadable document obvious from one request. Storage
 errors are also logged server-side (Vercel: Functions → Logs) with the backend
 label and the failing operation; tokens are never logged.
+
+`storage.contention` is the write-contention signal — watch it instead of
+discovering a problem later:
+
+| Counter | What it means |
+| --- | --- |
+| `writes` | Conditional writes that reached the backend |
+| `contended` | Writes that needed more than one attempt; the contention rate is `contended / writes` |
+| `conflicts` | Lost races in total, including those that ended in a give-up |
+| `contentionRetries` | Total retry attempts, so average attempts per contended write is `contentionRetries / contended` |
+| `giveUps` | Writes abandoned after exhausting the retry budget; anything non-zero here means changes went to durable pending storage |
+| `fallbacksWritten` / `fallbacksRecovered` | Change sets written to a durable pending record, and how many have been merged back into the document |
+| `pendingFallbacks` | Pending records seen during the last hydrate — durable, not yet stored |
+| `maxAttemptsUsed` | Worst single write in this process's lifetime |
+
+Each contended write logs `persisted the store after N attempts (write
+contention)`, and each give-up logs an error naming the durable record it wrote
+(`kept durably at news.pending-<id>.json`). `storage.lastError` carries the same
+information, so a give-up shows up on `/api/health` instead of vanishing.
 
 ## Project layout
 
