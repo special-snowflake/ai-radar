@@ -221,7 +221,7 @@ export function createBlobBackend({ pathname, access, token }: BlobBackendOption
         await put(target, JSON.stringify(record), {
           access,
           contentType: JSON_CONTENT_TYPE,
-          addRandomSuffix: false,
+          addRandomSuffix: true,
           cacheControlMaxAge: CACHE_MAX_AGE_SECONDS,
           ...credentials(),
         });
