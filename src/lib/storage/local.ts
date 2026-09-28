@@ -3,9 +3,14 @@ import path from "node:path";
 import {
   PENDING_RECORD_LIMIT,
   StorageConflictError,
+  isScanLeaseActive,
+  makeScanLeaseRecord,
   storageErrorMessage,
   type DocumentMeta,
   type PendingWriteRecord,
+  type ScanLeaseOptions,
+  type ScanLeaseRecord,
+  type ScanLeaseResult,
   type StorageBackend,
   type StoredDocument,
   type WriteOptions,
@@ -46,6 +51,7 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
   const label = path.join(path.relative(process.cwd(), dir) || dir, fileName).replace(/\\/g, "/");
   const pendingPrefix = `${fileName}.pending-`;
   const pendingFile = (id: string) => path.join(dir, `${pendingPrefix}${id}.json`);
+  const leaseFile = () => path.join(dir, `${fileName}.lease.json`);
 
   function readMeta(): DocumentMeta | null {
     if (!existsSync(file)) return null;
@@ -101,6 +107,41 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
       return readdirSync(dir).filter((name) => name.startsWith(pendingPrefix) && name.endsWith(".json")).length;
     } catch {
       return 0;
+    }
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /*  Scheduler lease                                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The lease is a sibling file, written with the same compare-and-swap the
+   * document uses. The `wx` flag is the whole trick: it creates the file or
+   * fails, so two processes booting at once cannot both become the winner.
+   */
+  function readLeaseSync(): ScanLeaseRecord | null {
+    const target = leaseFile();
+    if (!existsSync(target)) return null;
+    try {
+      const parsed = JSON.parse(readFileSync(target, "utf8")) as ScanLeaseRecord;
+      if (!parsed || typeof parsed.holder !== "string") return null;
+      return parsed;
+    } catch (error) {
+      console.warn(`[ai-radar] ignoring unreadable scan lease ${target}: ${storageErrorMessage(error)}`);
+      return null;
+    }
+  }
+
+  function writeLeaseSync(record: ScanLeaseRecord, exclusive: boolean): boolean {
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(leaseFile(), JSON.stringify(record), { encoding: "utf8", flag: exclusive ? "wx" : "w" });
+      return true;
+    } catch (error) {
+      // EEXIST: somebody else holds it. Anything else is a real problem the
+      // caller reports through the lease reason.
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
     }
   }
 
@@ -179,6 +220,45 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
       return true;
     },
 
+    async acquireScanLease({ holder, ttlMs, now = Date.now() }: ScanLeaseOptions): Promise<ScanLeaseResult> {
+      const current = readLeaseSync();
+      if (current && current.holder !== holder && isScanLeaseActive(current, now)) {
+        return { acquired: false, record: current, reason: `held by ${current.holder} until ${current.expiresAt}` };
+      }
+
+      const next = makeScanLeaseRecord(holder, ttlMs, now);
+      // Ours or expired: overwrite. Free slot: create exclusively so a
+      // concurrent first boot cannot slip in between the read and the write.
+      if (!current || current.holder === holder) {
+        if (writeLeaseSync(next, !current)) return { acquired: true, record: next, reason: null };
+      } else {
+        writeLeaseSync(next, false);
+        return { acquired: true, record: next, reason: null };
+      }
+
+      // The exclusive create lost the race: report whoever got there.
+      const winner = readLeaseSync();
+      return {
+        acquired: false,
+        record: winner,
+        reason: winner ? `held by ${winner.holder} until ${winner.expiresAt}` : "taken by another instance",
+      };
+    },
+
+    async releaseScanLease({ holder }: { holder: string }): Promise<boolean> {
+      const current = readLeaseSync();
+      // Only ever delete our own lease: a slow shutdown must not revoke the
+      // lease a newer instance already took over.
+      if (!current || current.holder !== holder) return false;
+      try {
+        unlinkSync(leaseFile());
+        return true;
+      } catch (error) {
+        console.warn(`[ai-radar] could not release the scan lease: ${storageErrorMessage(error)}`);
+        return false;
+      }
+    },
+
     describe(): Record<string, string | number | boolean> {
       const meta = readMeta();
       return {
@@ -191,6 +271,8 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
         // Cheap name-only count: `/api/health` must not read every record back.
         pendingFiles: countPendingSync(),
         pendingKeyPattern: `${pendingPrefix}*.json`,
+        leaseFile: leaseFile(),
+        scanLeaseHolder: readLeaseSync()?.holder ?? "",
       };
     },
   };

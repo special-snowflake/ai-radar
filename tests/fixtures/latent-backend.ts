@@ -16,6 +16,8 @@ import { createLocalBackend } from "../../src/lib/storage/local";
 import type {
   DocumentMeta,
   PendingWriteRecord,
+  ScanLeaseOptions,
+  ScanLeaseResult,
   StorageBackend,
   StoredDocument,
   WriteOptions,
@@ -47,6 +49,11 @@ export function createLatentBackend(options: {
     writePending: (record: PendingWriteRecord) => inner.writePending(record),
     listPending: () => inner.listPending(),
     resolvePending: (id: string) => inner.resolvePending(id),
+    // The lease is a one-off decision, so it does not need the artificial
+    // latency: latency here would only slow the fixture down, not change which
+    // process wins.
+    acquireScanLease: (options: ScanLeaseOptions): Promise<ScanLeaseResult> => inner.acquireScanLease(options),
+    releaseScanLease: (options: { holder: string }): Promise<boolean> => inner.releaseScanLease(options),
     describe: () => ({ ...inner.describe(), latencyMs }),
   };
 }

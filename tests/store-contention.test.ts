@@ -27,9 +27,14 @@ import { after, afterEach, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   StorageConflictError,
+  isScanLeaseActive,
+  makeScanLeaseRecord,
   setStorageBackendForTesting,
   storageErrorMessage,
   type PendingWriteRecord,
+  type ScanLeaseOptions,
+  type ScanLeaseRecord,
+  type ScanLeaseResult,
   type StorageBackend,
   type StoredDocument,
   type WriteOptions,
@@ -124,6 +129,8 @@ function createFakeBackend(initial: string | null, rivalActive = false): FakeBac
   let etag: string | null = initial === null ? null : "v1";
   let version = initial === null ? 0 : 1;
   const pending = new Map<string, PendingWriteRecord>();
+  /** Scheduler lease state, mirroring what a real backend stores. */
+  let lease: ScanLeaseRecord | null = null;
   const rival = { active: rivalActive };
   const controls = { pendingLatencyMs: 0 };
   let signalStarted: (() => void) | null = null;
@@ -204,6 +211,20 @@ function createFakeBackend(initial: string | null, rivalActive = false): FakeBac
 
       async resolvePending(id: string): Promise<boolean> {
         return pending.delete(id);
+      },
+
+      async acquireScanLease({ holder, ttlMs, now = Date.now() }: ScanLeaseOptions): Promise<ScanLeaseResult> {
+        if (lease && lease.holder !== holder && isScanLeaseActive(lease, now)) {
+          return { acquired: false, record: lease, reason: `held by ${lease.holder} until ${lease.expiresAt}` };
+        }
+        lease = makeScanLeaseRecord(holder, ttlMs, now);
+        return { acquired: true, record: lease, reason: null };
+      },
+
+      async releaseScanLease({ holder }: { holder: string }): Promise<boolean> {
+        if (!lease || lease.holder !== holder) return false;
+        lease = null;
+        return true;
       },
 
       describe() {

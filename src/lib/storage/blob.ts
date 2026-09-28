@@ -1,9 +1,14 @@
 import {
   PENDING_RECORD_LIMIT,
   StorageConflictError,
+  isScanLeaseActive,
+  makeScanLeaseRecord,
   storageErrorMessage,
   type DocumentMeta,
   type PendingWriteRecord,
+  type ScanLeaseOptions,
+  type ScanLeaseRecord,
+  type ScanLeaseResult,
   type StorageBackend,
   type StoredDocument,
   type WriteOptions,
@@ -45,16 +50,23 @@ function textByteLength(value: string): number {
   return new TextEncoder().encode(value).length;
 }
 
+/**
+ * `@vercel/blob` error classes do not set `name` (an SDK instance reports
+ * `name === "Error"`), so classification has to look at the SDK's fixed
+ * messages: `BlobNotFoundError` -> "The requested blob does not exist",
+ * `BlobPreconditionFailedError` -> "Precondition failed: ETag mismatch.".
+ */
 function isNotFoundError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return error.name === "BlobNotFoundError" || /not found/i.test(error.message);
+  return error.name === "BlobNotFoundError" || /does not exist|not found/i.test(error.message);
 }
 
 function isConflictError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === "BlobPreconditionFailedError") return true;
-  // `put(..., { allowOverwrite: false })` on an existing pathname.
-  return /already exists/i.test(error.message);
+  // `put(..., { ifMatch })` on a stale ETag, or `put(..., { allowOverwrite: false })`
+  // on an existing pathname.
+  return /already exists|precondition failed|etag mismatch/i.test(error.message);
 }
 
 export function createBlobBackend({ pathname, access, token }: BlobBackendOptions): StorageBackend {
@@ -71,6 +83,29 @@ export function createBlobBackend({ pathname, access, token }: BlobBackendOption
   const pendingPathname = (id: string) =>
     pathname.replace(/(\.[^./]+)?$/, (extension) => `${pendingMarker}${id}${extension || ".json"}`);
   const pendingPrefix = `${pathname.replace(/(\.[^./]+)$/, "")}${pendingMarker}`;
+
+  /**
+   * The lease lives in its own key (`news.lease.json`), written with the same
+   * conditional-write primitives as the document: `allowOverwrite: false` for a
+   * free slot, `ifMatch` to take over an expired one. The Blob API therefore
+   * decides the winner of a simultaneous first boot, not the application.
+   */
+  const leasePathname = pathname.replace(/(\.[^./]+)?$/, (extension) => `.lease${extension || ".json"}`);
+
+  async function readLease(): Promise<{ record: ScanLeaseRecord; etag: string | null } | null> {
+    const { get } = await import("@vercel/blob");
+    try {
+      const result = await get(leasePathname, { access, useCache: false, ...credentials() });
+      if (!result) return null;
+      const parsed = JSON.parse(await new Response(result.stream).text()) as ScanLeaseRecord;
+      if (!parsed || typeof parsed.holder !== "string") return null;
+      return { record: parsed, etag: result.blob.etag || `blob:${result.blob.uploadedAt.getTime()}` };
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      console.warn(`[ai-radar] ignoring unreadable scan lease ${leasePathname}: ${storageErrorMessage(error)}`);
+      return null;
+    }
+  }
 
   async function readPending(path: string): Promise<PendingWriteRecord | null> {
     const { get } = await import("@vercel/blob");
@@ -226,6 +261,67 @@ export function createBlobBackend({ pathname, access, token }: BlobBackendOption
       }
     },
 
+    async acquireScanLease({ holder, ttlMs, now = Date.now() }: ScanLeaseOptions): Promise<ScanLeaseResult> {
+      const { put } = await import("@vercel/blob");
+      const shared = {
+        access,
+        contentType: JSON_CONTENT_TYPE,
+        addRandomSuffix: false,
+        cacheControlMaxAge: CACHE_MAX_AGE_SECONDS,
+        ...credentials(),
+      };
+
+      const current = await readLease();
+      if (current && current.record.holder !== holder && isScanLeaseActive(current.record, now)) {
+        return {
+          acquired: false,
+          record: current.record,
+          reason: `held by ${current.record.holder} until ${current.record.expiresAt}`,
+        };
+      }
+
+      const next = makeScanLeaseRecord(holder, ttlMs, now);
+      try {
+        if (!current) {
+          // Nobody holds it: create-only, so exactly one first boot wins.
+          await put(leasePathname, JSON.stringify(next), { ...shared, allowOverwrite: false });
+        } else {
+          // Ours to renew, or expired to take over — both are a conditional
+          // write against the version we just read.
+          await put(leasePathname, JSON.stringify(next), { ...shared, ifMatch: current.etag ?? undefined });
+        }
+        return { acquired: true, record: next, reason: null };
+      } catch (error) {
+        if (!isConflictError(error)) {
+          console.warn(`[ai-radar] could not take the scan lease at ${leasePathname}: ${storageErrorMessage(error)}`);
+          return { acquired: false, record: current?.record ?? null, reason: storageErrorMessage(error) };
+        }
+        // Lost the race: report the incumbent rather than pretending to own it.
+        const winner = (await readLease())?.record ?? current?.record ?? null;
+        return {
+          acquired: false,
+          record: winner,
+          reason: winner ? `held by ${winner.holder} until ${winner.expiresAt}` : "taken by another instance",
+        };
+      }
+    },
+
+    async releaseScanLease({ holder }: { holder: string }): Promise<boolean> {
+      const { del } = await import("@vercel/blob");
+      const current = await readLease();
+      // Only ever delete our own lease: a slow shutdown must not revoke the
+      // lease a newer instance already took over.
+      if (!current || current.record.holder !== holder) return false;
+      try {
+        await del(leasePathname, credentials());
+        return true;
+      } catch (error) {
+        if (isNotFoundError(error)) return true;
+        console.warn(`[ai-radar] could not release the scan lease at ${leasePathname}: ${storageErrorMessage(error)}`);
+        return false;
+      }
+    },
+
     describe(): Record<string, string | number | boolean> {
       return {
         kind: "blob",
@@ -234,6 +330,7 @@ export function createBlobBackend({ pathname, access, token }: BlobBackendOption
         access,
         explicitToken: Boolean(token),
         pendingKeyPattern: `${pendingPrefix}*.json`,
+        leasePathname,
       };
     },
   };

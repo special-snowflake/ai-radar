@@ -4,10 +4,12 @@ import { classifyArticle } from "./classify";
 import { reconcileSources } from "./sources";
 import {
   DB_FILE_NAME,
+  PENDING_RECORD_MAX_AGE_MS,
   StorageConflictError,
   dataDirectory,
   describeStorage,
   mergePendingDocument,
+  pendingRecordAgeMs,
   resolveStorageBackend,
   type PendingWriteRecord,
   type StorageBackend,
@@ -296,6 +298,8 @@ export interface WriteMetrics {
   fallbacksRecovered: number;
   /** Pending records seen in the backend during the last hydrate. */
   pendingFallbacks: number;
+  /** Pending records dropped for being older than the retention window. */
+  pendingPruned: number;
   lastGiveUpAt: string | null;
   /** Highest attempt count a single write needed. */
   maxAttemptsUsed: number;
@@ -311,6 +315,7 @@ function emptyMetrics(): WriteMetrics {
     fallbacksWritten: 0,
     fallbacksRecovered: 0,
     pendingFallbacks: 0,
+    pendingPruned: 0,
     lastGiveUpAt: null,
     maxAttemptsUsed: 0,
   };
@@ -320,6 +325,15 @@ interface StoreState {
   db: RadarDatabase;
   /** True once the document has been read from the configured backend. */
   hydrated: boolean;
+  /**
+   * True once durable pending records have been merged back for this process.
+   *
+   * Tracked separately from `hydrated` because local development adopts the
+   * document synchronously in {@link state}, which would otherwise make
+   * `ensureStoreLoaded()` return early and skip the recovery pass that the Blob
+   * path gets.
+   */
+  pendingRecovered: boolean;
   hydrating: Promise<void> | null;
   /** Version token of the document this process last read or wrote. */
   etag: string | null;
@@ -491,6 +505,8 @@ function adopt(current: StoreState, document: StoredDocument | null, backend: St
   current.dirty = false;
   current.hydrated = true;
   current.hydrateError = null;
+  // A freshly read document has not been reconciled with the pending queue yet.
+  current.pendingRecovered = false;
 }
 
 async function hydrate(current: StoreState): Promise<void> {
@@ -526,6 +542,7 @@ function state(): StoreState {
     const current: StoreState = {
       db: createEmptyDatabase(now),
       hydrated: false,
+      pendingRecovered: false,
       hydrating: null,
       etag: null,
       baseJson: null,
@@ -570,12 +587,38 @@ function state(): StoreState {
  * every server entry point, and it never throws: failures are recorded (see
  * `getStoreStatus()`) so the app reports a clear diagnostic instead of serving
  * empty data and writing it back over the real document.
+ *
+ * Also runs the durable-pending pass exactly once per process, which includes
+ * pruning records past their retention window. Local development is already
+ * `hydrated` by the time this is called (the file backend reads synchronously),
+ * so the recovery pass is deliberately not folded into `hydrated` — otherwise
+ * local pending records would never be merged back.
  */
 export function ensureStoreLoaded(): Promise<void> {
   const current = state();
-  if (current.hydrated) return Promise.resolve();
+  if (current.hydrated && current.pendingRecovered) return Promise.resolve();
   if (!current.hydrating) {
-    current.hydrating = hydrate(current).finally(() => {
+    current.hydrating = (async () => {
+      if (!current.hydrated) {
+        await hydrate(current);
+        return;
+      }
+      // Already hydrated synchronously (local backend): still owe the pending
+      // queue its recovery pass.
+      let backend: StorageBackend;
+      try {
+        backend = resolveStorageBackend();
+      } catch (error) {
+        current.hydrateError = errorMessage(error);
+        console.error(`[ai-radar] storage is not configured: ${current.hydrateError}`);
+        return;
+      }
+      try {
+        await recoverPendingWrites(current, backend, current.baseJson);
+      } catch (error) {
+        console.error(`[ai-radar] could not recover pending changes of ${backend.label}: ${errorMessage(error)}`);
+      }
+    })().finally(() => {
       current.hydrating = null;
     });
   }
@@ -952,6 +995,68 @@ async function clearPendingRecord(backend: StorageBackend, id: string): Promise<
 }
 
 /**
+ * Delete pending records that are past their retention window.
+ *
+ * A record older than {@link PENDING_RECORD_MAX_AGE_MS} (7 days) will not merge
+ * back any more: the document it was based on has long moved on, so a merge
+ * would either be a no-op or would resurrect stale articles. Left in place they
+ * cost a listing and a download on every single hydrate, and `listPending()` is
+ * capped, so old records would quietly push newer (recoverable) ones out of
+ * view.
+ *
+ * Every pruned id is logged explicitly: this deletes data, and the only
+ * acceptable way to do that is loudly and by name, so an operator who still
+ * wants one can pull it with `npm run recover-pending` before it goes.
+ *
+ * Failures are non-fatal: an undeletable record is left alone and reported.
+ */
+export async function pruneExpiredPendingRecords(
+  backend: StorageBackend,
+  options: { now?: number; maxAgeMs?: number } = {},
+): Promise<string[]> {
+  let records: PendingWriteRecord[];
+  try {
+    records = await backend.listPending();
+  } catch (error) {
+    console.warn(`[ai-radar] could not list pending changes of ${backend.label}: ${errorMessage(error)}`);
+    return [];
+  }
+
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? PENDING_RECORD_MAX_AGE_MS;
+  const pruned: string[] = [];
+
+  for (const record of records) {
+    const age = pendingRecordAgeMs(record, now);
+    if (age !== null && age <= maxAgeMs) continue;
+
+    // Undated records are kept: an unknown age is not evidence of staleness.
+    if (age === null) {
+      console.warn(
+        `[ai-radar] keeping pending change set ${record.id} of ${backend.label}: no parsable createdAt, so its age is unknown`,
+      );
+      continue;
+    }
+
+    try {
+      const removed = await backend.resolvePending(record.id);
+      if (!removed) continue; // somebody else already recovered it
+      pruned.push(record.id);
+      console.warn(
+        `[ai-radar] pruned pending change set ${record.id} of ${backend.label} ` +
+          `(created ${record.createdAt}, ${Math.round(age / 86_400_000)}d old, ${record.changes} change(s) never stored)`,
+      );
+    } catch (error) {
+      console.warn(
+        `[ai-radar] could not prune stale pending change set ${record.id} of ${backend.label}: ${errorMessage(error)}`,
+      );
+    }
+  }
+
+  return pruned;
+}
+
+/**
  * Merge change sets that an earlier process could not write back into the
  * document (three-way merge against the stored version, see `./storage/merge`)
  * and let the next flush store the result. Nothing is dropped when a merge is
@@ -962,10 +1067,20 @@ async function recoverPendingWrites(
   backend: StorageBackend,
   remoteJson: string | null,
 ): Promise<void> {
+  // Prune first: `listPending()` is capped, so a backlog of ancient records
+  // would otherwise hide the recent, actually recoverable ones.
+  current.metrics.pendingPruned += (await pruneExpiredPendingRecords(backend)).length;
+
+  // Listing worked, so the queue has been dealt with for this process. Marked
+  // before the early returns below so a queue that is empty (or unmergeable
+  // right now) is not retried on every single request.
+  current.pendingRecovered = true;
+
   let records: PendingWriteRecord[];
   try {
     records = await backend.listPending();
   } catch (error) {
+    current.pendingRecovered = false;
     console.warn(`[ai-radar] could not list pending changes of ${backend.label}: ${errorMessage(error)}`);
     return;
   }

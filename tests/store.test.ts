@@ -214,6 +214,7 @@ describe("storage backend resolution", () => {
       access: "private",
       explicitToken: true,
       pendingKeyPattern: "news.pending-*.json",
+      leasePathname: "news.lease.json",
     });
     assert.ok(!JSON.stringify(backend.describe()).includes("super-secret"));
   });

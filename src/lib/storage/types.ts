@@ -85,6 +85,56 @@ export interface PendingWriteRecord {
 /** Upper bound on how many pending records are read/returned at once. */
 export const PENDING_RECORD_LIMIT = 20;
 
+/**
+ * How long a pending record is kept before it is pruned.
+ *
+ * A pending record exists so an unpersisted change set can be merged back later.
+ * A record that is still unmergeable after a week is not going to recover: the
+ * document it was based on has moved on, the serverless instance that wrote it is
+ * long gone, and keeping it only makes `listPending()` slower on every hydrate.
+ * So records are pruned automatically after this age — always loudly, naming
+ * every pruned id, so an operator can still recover one by hand with
+ * `npm run recover-pending` before it disappears.
+ */
+export const PENDING_RECORD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * A scheduler lease: "this instance is the one allowed to run the scan loop".
+ *
+ * The in-process scheduler runs in *every* server process, which is exactly
+ * wrong on a serverless platform (every instance would scan and write). The
+ * lease is a single small record in the storage backend, taken with the same
+ * compare-and-swap the document write uses, so the first instance to win it
+ * scans and the rest stay idle. It has a TTL because a holder can be frozen or
+ * killed without releasing anything.
+ */
+export interface ScanLeaseRecord {
+  /** Opaque id of the instance that holds the lease (safe to log). */
+  holder: string;
+  /** ISO timestamp the lease was taken. */
+  acquiredAt: string;
+  /** ISO timestamp after which another instance may take the lease over. */
+  expiresAt: string;
+}
+
+export interface ScanLeaseOptions {
+  /** Identity of this process, e.g. `<hostname>-<pid>`. */
+  holder: string;
+  /** Lease lifetime in ms; the winner renews it on every scheduler tick. */
+  ttlMs: number;
+  /** Injectable clock (tests). */
+  now?: number;
+}
+
+export interface ScanLeaseResult {
+  /** True when this caller now holds the lease. */
+  acquired: boolean;
+  /** The stored lease after the attempt (the winner's, or the incumbent's). */
+  record: ScanLeaseRecord | null;
+  /** Why the lease was not taken — safe to log, used in the scheduler message. */
+  reason: string | null;
+}
+
 export interface StorageBackend {
   readonly kind: StorageBackendKind;
   /** Human readable target, e.g. `data/db.json` — never contains credentials. */
@@ -111,6 +161,19 @@ export interface StorageBackend {
   listPending(): Promise<PendingWriteRecord[]>;
   /** Drop a record once its changes are known to be in the primary document. */
   resolvePending(id: string): Promise<boolean>;
+  /**
+   * Take the scheduler lease if it is free, ours, or expired.
+   *
+   * Must be atomic: two instances booting at the same time have to produce
+   * exactly one winner. The TTL bounds how long a frozen instance keeps other
+   * instances out of the scan loop.
+   */
+  acquireScanLease(options: ScanLeaseOptions): Promise<ScanLeaseResult>;
+  /**
+   * Give the lease up on a clean shutdown so the next instance can start
+   * scanning immediately instead of waiting for the TTL.
+   */
+  releaseScanLease(options: { holder: string }): Promise<boolean>;
   /** Non-secret diagnostics for `/api/health` and logs. */
   describe(): Record<string, string | number | boolean>;
 }
@@ -139,4 +202,46 @@ export function storageErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return "unknown storage error";
+}
+
+/**
+ * Age of a pending record in ms, or `null` when it cannot be determined.
+ *
+ * `createdAt` is the honest clock, but a hand-written or truncated record may
+ * not have a parsable one. Returning `null` (instead of guessing) lets callers
+ * decide explicitly, and {@link isPendingRecordExpired} treats it as "keep".
+ */
+export function pendingRecordAgeMs(record: PendingWriteRecord, now: number = Date.now()): number | null {
+  const created = Date.parse(record.createdAt);
+  if (!Number.isFinite(created)) return null;
+  return now - created;
+}
+
+/** True when a pending record is old enough to be pruned. Undated records are kept. */
+export function isPendingRecordExpired(
+  record: PendingWriteRecord,
+  options: { now?: number; maxAgeMs?: number } = {},
+): boolean {
+  const age = pendingRecordAgeMs(record, options.now);
+  if (age === null) return false;
+  return age > (options.maxAgeMs ?? PENDING_RECORD_MAX_AGE_MS);
+}
+
+/** True while a stored lease still blocks other instances. */
+export function isScanLeaseActive(record: ScanLeaseRecord | null, now: number = Date.now()): boolean {
+  if (!record) return false;
+  const expires = Date.parse(record.expiresAt);
+  // An unparsable expiry is treated as expired: a corrupt lease must not park
+  // the whole deployment's scan loop forever.
+  if (!Number.isFinite(expires)) return false;
+  return expires > now;
+}
+
+/** Build the lease this caller would store, from a clean or expired slot. */
+export function makeScanLeaseRecord(holder: string, ttlMs: number, now: number = Date.now()): ScanLeaseRecord {
+  return {
+    holder,
+    acquiredAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ttlMs).toISOString(),
+  };
 }
