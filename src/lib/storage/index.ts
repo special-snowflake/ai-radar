@@ -20,6 +20,7 @@ import { StorageConfigurationError, type StorageBackend, type StorageBackendKind
 
 export * from "./types";
 export { createBlobBackend, createLocalBackend };
+export { mergePendingDocument, jsonEqual } from "./merge";
 export type { BlobAccess };
 
 /** File name of the local JSON document (unchanged from the pre-Blob app). */
@@ -123,6 +124,15 @@ export function resolveStorageBackend(): StorageBackend {
 /** Drop the memoised backend + warn-once state (used by tests). */
 export function resetStorageBackend(): void {
   cachedBackend = null;
+}
+
+/**
+ * Test seam: install a backend instead of resolving one from the environment.
+ * Only the test suite uses this (to inject deterministic contention); normal
+ * code always goes through {@link resolveStorageBackend}.
+ */
+export function setStorageBackendForTesting(backend: StorageBackend | null): void {
+  cachedBackend = backend;
 }
 
 /** Non-secret storage summary for logs and `/api/health`. */

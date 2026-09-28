@@ -52,6 +52,39 @@ export interface WriteResult {
   meta: DocumentMeta;
 }
 
+/**
+ * A last-resort, durable record of changes that could not be written.
+ *
+ * Neither backend offers an atomic merge, so a conditional write can lose a
+ * race more often than the retry budget allows (see `src/lib/store.ts`). The
+ * store then hands the whole merged document to the backend under a sibling
+ * key — a dead-letter queue with one entry per abandoned change set — so the
+ * data survives the process (serverless instances are recycled without notice)
+ * and a later process can merge it back in.
+ */
+export interface PendingWriteRecord {
+  /** Unique, sortable id (`<iso>-<random>`); also the key suffix in storage. */
+  id: string;
+  createdAt: string;
+  /** Backend label the write was aimed at, e.g. `vercel-blob:news.json`. */
+  label: string;
+  /** Why the write was abandoned. Safe to log. */
+  reason: string;
+  /** Attempts consumed before giving up. */
+  attempts: number;
+  /** Version the local changes were applied to (`null` = document did not exist). */
+  baseEtag: string | null;
+  /** Serialized document the local changes were applied to (`null` = it did not exist). */
+  base: string | null;
+  /** Serialized document *including* the local changes that failed to persist. */
+  document: string;
+  /** Number of local changes in the abandoned batch. */
+  changes: number;
+}
+
+/** Upper bound on how many pending records are read/returned at once. */
+export const PENDING_RECORD_LIMIT = 20;
+
 export interface StorageBackend {
   readonly kind: StorageBackendKind;
   /** Human readable target, e.g. `data/db.json` — never contains credentials. */
@@ -68,6 +101,16 @@ export interface StorageBackend {
    * Best effort: returns the backup location, or `null` when nothing was kept.
    */
   quarantine(reason: string, json: string): Promise<string | null>;
+  /**
+   * Durably keep a change set that could not be written, under a key of its own
+   * so the primary document is never touched. Must survive this process.
+   * @returns where the record was kept (safe to log).
+   */
+  writePending(record: PendingWriteRecord): Promise<string>;
+  /** Pending records still waiting to be merged back, newest first. */
+  listPending(): Promise<PendingWriteRecord[]>;
+  /** Drop a record once its changes are known to be in the primary document. */
+  resolvePending(id: string): Promise<boolean>;
   /** Non-secret diagnostics for `/api/health` and logs. */
   describe(): Record<string, string | number | boolean>;
 }

@@ -1,9 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  PENDING_RECORD_LIMIT,
   StorageConflictError,
   storageErrorMessage,
   type DocumentMeta,
+  type PendingWriteRecord,
   type StorageBackend,
   type StoredDocument,
   type WriteOptions,
@@ -42,6 +44,8 @@ export interface LocalStorageBackend extends StorageBackend {
 export function createLocalBackend({ dir, fileName }: LocalBackendOptions): LocalStorageBackend {
   const file = path.join(dir, fileName);
   const label = path.join(path.relative(process.cwd(), dir) || dir, fileName).replace(/\\/g, "/");
+  const pendingPrefix = `${fileName}.pending-`;
+  const pendingFile = (id: string) => path.join(dir, `${pendingPrefix}${id}.json`);
 
   function readMeta(): DocumentMeta | null {
     if (!existsSync(file)) return null;
@@ -58,6 +62,46 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
     const json = readFileSync(file, "utf8");
     const meta = readMeta() ?? { etag: `0:${Date.now()}`, size: json.length, updatedAt: null };
     return { meta, json };
+  }
+
+  /** Parse one pending record; a damaged file is skipped, never deleted. */
+  function readPendingFile(target: string): PendingWriteRecord | null {
+    try {
+      const parsed = JSON.parse(readFileSync(target, "utf8")) as PendingWriteRecord;
+      if (!parsed || typeof parsed.id !== "string" || typeof parsed.document !== "string") return null;
+      return parsed;
+    } catch (error) {
+      console.warn(`[ai-radar] ignoring unreadable pending write ${target}: ${storageErrorMessage(error)}`);
+      return null;
+    }
+  }
+
+  function readPendingSync(): PendingWriteRecord[] {
+    if (!existsSync(dir)) return [];
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch (error) {
+      console.warn(`[ai-radar] could not list pending writes in ${dir}: ${storageErrorMessage(error)}`);
+      return [];
+    }
+    return names
+      .filter((name) => name.startsWith(pendingPrefix) && name.endsWith(".json"))
+      .map((name) => readPendingFile(path.join(dir, name)))
+      .filter((record): record is PendingWriteRecord => record !== null)
+      // Ids start with an ISO timestamp, so a name sort is a chronological sort.
+      .sort((a, b) => b.id.localeCompare(a.id))
+      .slice(0, PENDING_RECORD_LIMIT);
+  }
+
+  /** Name-only count: cheap enough for `/api/health` on every request. */
+  function countPendingSync(): number {
+    if (!existsSync(dir)) return 0;
+    try {
+      return readdirSync(dir).filter((name) => name.startsWith(pendingPrefix) && name.endsWith(".json")).length;
+    } catch {
+      return 0;
+    }
   }
 
   return {
@@ -115,6 +159,26 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
       }
     },
 
+    async writePending(record: PendingWriteRecord): Promise<string> {
+      // A sibling file, never the document itself: a change set that could not
+      // be written must not corrupt (or overwrite) the one that could.
+      mkdirSync(dir, { recursive: true });
+      const target = pendingFile(record.id);
+      writeFileSync(target, JSON.stringify(record), "utf8");
+      return target;
+    },
+
+    async listPending(): Promise<PendingWriteRecord[]> {
+      return readPendingSync();
+    },
+
+    async resolvePending(id: string): Promise<boolean> {
+      const target = pendingFile(id);
+      if (!existsSync(target)) return false;
+      unlinkSync(target);
+      return true;
+    },
+
     describe(): Record<string, string | number | boolean> {
       const meta = readMeta();
       return {
@@ -124,6 +188,9 @@ export function createLocalBackend({ dir, fileName }: LocalBackendOptions): Loca
         exists: meta !== null,
         sizeBytes: meta?.size ?? 0,
         modifiedAt: meta?.updatedAt ?? "",
+        // Cheap name-only count: `/api/health` must not read every record back.
+        pendingFiles: countPendingSync(),
+        pendingKeyPattern: `${pendingPrefix}*.json`,
       };
     },
   };

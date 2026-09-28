@@ -7,7 +7,9 @@ import {
   StorageConflictError,
   dataDirectory,
   describeStorage,
+  mergePendingDocument,
   resolveStorageBackend,
+  type PendingWriteRecord,
   type StorageBackend,
   type StorageBackendKind,
   type StoredDocument,
@@ -48,6 +50,13 @@ import { isCategoryId } from "./types";
  * server, or a second serverless instance — the pending in-memory changes are
  * replayed on top of the fresh document instead of overwriting it, so no edit is
  * silently lost.
+ *
+ * Contention (see `persist`): retries use exponential backoff with jitter, and
+ * when the retry budget is exhausted the change set is written to a durable
+ * pending record in the backend (a sibling `*.pending-*` key) before the call
+ * returns. A serverless instance can be recycled at any moment, so a change set
+ * must never exist only in process memory. `ensureStoreLoaded()` merges pending
+ * records back in (three-way merge, see `./storage/merge`).
  */
 
 export const STORE_VERSION = 1;
@@ -251,6 +260,62 @@ export function loadSeedArticles(): Article[] {
 /** A change applied to the in-memory document; kept so it can be replayed after a rebase. */
 type MutationThunk = (db: RadarDatabase) => unknown;
 
+/** A durable pending record this process owns (refreshed on repeated give-ups). */
+interface FallbackRecord {
+  id: string;
+  /** JSON that was handed to the backend — used to detect a remote copy of it. */
+  document: string;
+  /**
+   * Number of pending changes the record's document covers. A remote document
+   * that equals this record only holds *those* changes, so the change set may
+   * only be treated as "already stored" while the pending queue has not grown
+   * past it.
+   */
+  changes: number;
+}
+
+/**
+ * Contention counters. Logged per write and reported through
+ * `getStoreStatus()`/`/api/health` so a rising give-up rate is visible instead
+ * of showing up as missing data weeks later.
+ */
+export interface WriteMetrics {
+  /** Conditional writes that reached the backend. */
+  writes: number;
+  /** Writes that needed more than one attempt. */
+  contended: number;
+  /** Every lost race, including those that ended in a give-up. */
+  conflicts: number;
+  /** Retry attempts caused by losing a race (contended writes × attempts − 1). */
+  contentionRetries: number;
+  /** Writes abandoned after exhausting the retry budget. */
+  giveUps: number;
+  /** Change sets handed to durable pending records. */
+  fallbacksWritten: number;
+  /** Pending records merged back into the document and cleared. */
+  fallbacksRecovered: number;
+  /** Pending records seen in the backend during the last hydrate. */
+  pendingFallbacks: number;
+  lastGiveUpAt: string | null;
+  /** Highest attempt count a single write needed. */
+  maxAttemptsUsed: number;
+}
+
+function emptyMetrics(): WriteMetrics {
+  return {
+    writes: 0,
+    contended: 0,
+    conflicts: 0,
+    contentionRetries: 0,
+    giveUps: 0,
+    fallbacksWritten: 0,
+    fallbacksRecovered: 0,
+    pendingFallbacks: 0,
+    lastGiveUpAt: null,
+    maxAttemptsUsed: 0,
+  };
+}
+
 interface StoreState {
   db: RadarDatabase;
   /** True once the document has been read from the configured backend. */
@@ -258,6 +323,12 @@ interface StoreState {
   hydrating: Promise<void> | null;
   /** Version token of the document this process last read or wrote. */
   etag: string | null;
+  /**
+   * Serialized document the version token belongs to, i.e. the stored state
+   * *without* the pending changes. Kept so an abandoned change set can be
+   * described as "base -> document" for a recovery merge.
+   */
+  baseJson: string | null;
   /** Changes applied since the last successful write (replayed when rebasing). */
   pending: MutationThunk[];
   dirty: boolean;
@@ -267,9 +338,93 @@ interface StoreState {
   lastWriteAt: string | null;
   lastError: string | null;
   hydrateError: string | null;
+  /** Durable record written for changes this process failed to persist. */
+  fallbackWritten: FallbackRecord | null;
+  /**
+   * Records merged into memory at hydrate, cleared once the merged document is
+   * stored. `changes` is 0 because the merge happens on a fresh state (nothing
+   * else is pending when it runs).
+   */
+  fallbackRecovered: { ids: string[]; document: string; changes: number } | null;
+  metrics: WriteMetrics;
 }
 
+
 const globalRef = globalThis as unknown as { __aiRadarStore?: StoreState };
+
+/* -------------------------------------------------------------------------- */
+/*  Write retry policy (contention)                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Retry policy for conditional writes.
+ *
+ * Both backends are compare-and-swap only: read the version, write with it,
+ * lose the race if somebody else wrote in between. Under concurrent writers the
+ * retry loop therefore needs to *desynchronise* — retrying immediately in
+ * lockstep with the other writer just loses again. Every value is configurable
+ * (see `.env.example`) so a deployment can widen the budget without a code
+ * change.
+ */
+export interface WriteRetryPolicy {
+  /** Total attempts per flush, including the first. */
+  attempts: number;
+  /** Delay before the second attempt; doubles per attempt. */
+  baseDelayMs: number;
+  /** Upper bound for a single backoff delay. */
+  maxDelayMs: number;
+  /**
+   * Wall-clock budget for the retries. Once it is spent the durable fallback
+   * runs instead of sleeping past a serverless function timeout.
+   */
+  deadlineMs: number;
+}
+
+export const DEFAULT_WRITE_RETRY_POLICY: WriteRetryPolicy = {
+  attempts: 5,
+  baseDelayMs: 150,
+  maxDelayMs: 2_000,
+  deadlineMs: 5_000,
+};
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number.parseInt(process.env[name] ?? "", 10);
+  if (!Number.isFinite(raw) || raw < min) return fallback;
+  return Math.min(raw, max);
+}
+
+/** Current retry policy, read from the environment (cheap; a few times a minute). */
+export function writeRetryPolicy(): WriteRetryPolicy {
+  const attempts = envInt("STORE_WRITE_ATTEMPTS", DEFAULT_WRITE_RETRY_POLICY.attempts, 1, 20);
+  const baseDelayMs = envInt("STORE_WRITE_BACKOFF_MS", DEFAULT_WRITE_RETRY_POLICY.baseDelayMs, 0, 60_000);
+  const maxDelayMs = Math.max(
+    baseDelayMs,
+    envInt("STORE_WRITE_BACKOFF_MAX_MS", DEFAULT_WRITE_RETRY_POLICY.maxDelayMs, 0, 120_000),
+  );
+  const deadlineMs = envInt("STORE_WRITE_DEADLINE_MS", DEFAULT_WRITE_RETRY_POLICY.deadlineMs, 0, 300_000);
+  return { attempts, baseDelayMs, maxDelayMs, deadlineMs };
+}
+
+/**
+ * Exponential backoff with "equal jitter": half of the window is fixed, half is
+ * random. The fixed half guarantees a contender actually pauses instead of
+ * hammering the backend, the random half breaks the lockstep that made two
+ * writers collide over and over (which is what filled the logs with
+ * "changed since it was read; rebasing").
+ */
+export function backoffDelayMs(attempt: number, policy: WriteRetryPolicy, random: () => number = Math.random): number {
+  const window = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, attempt - 1));
+  if (window <= 0) return 0;
+  const half = window / 2;
+  return Math.round(half + random() * half);
+}
+
+/** Unique, sortable id for a durable pending record (`<iso>-<random>`). */
+function createPendingRecordId(): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const random = Math.random().toString(36).slice(2, 8);
+  return `${stamp}-${random}`;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -324,11 +479,13 @@ function adopt(current: StoreState, document: StoredDocument | null, backend: St
   if (document) {
     current.db = parseDocument(document.json, backend);
     current.etag = document.meta.etag;
+    current.baseJson = document.json;
   } else {
     // Nothing stored yet: start from the empty (seeded) database. It is written
     // on the first change, exactly like the pre-Blob store did.
     current.db = createSeededDatabase(new Date().toISOString());
     current.etag = null;
+    current.baseJson = null;
   }
   current.pending = [];
   current.dirty = false;
@@ -348,8 +505,12 @@ async function hydrate(current: StoreState): Promise<void> {
   }
 
   try {
-    adopt(current, await backend.read(), backend);
+    const document = await backend.read();
+    adopt(current, document, backend);
     current.lastError = null;
+    // Finish what an earlier process could not: change sets that were durable
+    // but never landed are merged back in before the app starts serving.
+    await recoverPendingWrites(current, backend, document?.json ?? null);
   } catch (error) {
     // Stay unhydrated and report through `getStoreStatus()` / `/api/health`;
     // the next request retries instead of caching the failure forever.
@@ -367,6 +528,7 @@ function state(): StoreState {
       hydrated: false,
       hydrating: null,
       etag: null,
+      baseJson: null,
       pending: [],
       dirty: false,
       timer: null,
@@ -374,6 +536,9 @@ function state(): StoreState {
       lastWriteAt: null,
       lastError: null,
       hydrateError: null,
+      fallbackWritten: null,
+      fallbackRecovered: null,
+      metrics: emptyMetrics(),
     };
     globalRef.__aiRadarStore = current;
 
@@ -504,6 +669,8 @@ export interface StoreStatus {
   lastError: string | null;
   documentUpdatedAt: string | null;
   articles: number;
+  /** Write contention + durable-fallback counters (see README, "Concurrency"). */
+  contention: WriteMetrics;
 }
 
 /** Storage diagnostics for `/api/health` and the settings screen. Never throws. */
@@ -518,14 +685,13 @@ export function getStoreStatus(): StoreStatus {
     lastError: current.lastError ?? current.hydrateError,
     documentUpdatedAt: current.db.updatedAt ?? null,
     articles: current.db.articles.length,
+    contention: { ...current.metrics },
   };
 }
+
 /* -------------------------------------------------------------------------- */
 /*  Conditional writes (optimistic concurrency)                                */
 /* -------------------------------------------------------------------------- */
-
-const WRITE_ATTEMPTS = 3;
-const WRITE_RETRY_DELAY_MS = 200;
 
 /**
  * Re-apply the changes made since the last successful write to another document
@@ -549,8 +715,13 @@ function replay(db: RadarDatabase, thunks: MutationThunk[]): RadarDatabase {
  *
  * The flow mirrors the classic compare-and-swap loop: check the stored version
  * (cheap `stat`), rebase local changes onto a newer document when somebody else
- * won the race, then write with `ifMatch`. Never throws — a failure leaves the
- * changes in `pending` and is reported through `getStoreStatus()`.
+ * won the race, then write with `ifMatch`. Retries wait out an exponential
+ * backoff with jitter, and when the budget is exhausted the change set is handed
+ * to durable storage ({@link preservePendingChanges}) instead of being left in
+ * process memory — a serverless instance can be recycled at any moment.
+ *
+ * Never throws — a failure is reported through `lastError`, the metrics and
+ * `getStoreStatus()`, and the changes stay `pending` for the next flush.
  */
 async function persist(current: StoreState): Promise<void> {
   if (!current.hydrated || (!current.dirty && current.pending.length === 0)) return;
@@ -564,56 +735,274 @@ async function persist(current: StoreState): Promise<void> {
     return;
   }
 
+  const policy = writeRetryPolicy();
+  const startedAt = Date.now();
   // Snapshot the changes this write is responsible for; anything recorded while
   // the request is in flight stays pending for the next flush.
   const batch = current.pending.slice();
   let rebase = false;
+  let attemptsUsed = 0;
+  let contended = false;
+  let lastConflict = false;
 
-  for (let attempt = 1; attempt <= WRITE_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= policy.attempts; attempt += 1) {
+    attemptsUsed = attempt;
     try {
       const remote = await backend.stat();
 
-      if (rebase || (remote && remote.etag !== current.etag)) {
+      // A rebase is needed whenever the stored version is not the one this
+      // document was built on: somebody moved it, removed it or created it.
+      if (rebase || (remote === null ? current.etag !== null : remote.etag !== current.etag)) {
         const latest = await backend.read();
+        const abandoned = current.fallbackWritten ?? current.fallbackRecovered;
+        // Somebody already stored exactly the change set we could not write (a
+        // pending record recovered by another instance): adopt it instead of
+        // replaying the same changes on top of themselves. Only valid while the
+        // record still covers the whole pending queue — a change made after the
+        // record was written is *not* in it and must not be dropped.
+        const abandonedCoversBatch = abandoned !== null && batch.length === abandoned.changes;
+        if (latest && abandoned && abandonedCoversBatch && latest.json === abandoned.document) {
+          console.info(
+            `[ai-radar] ${backend.label} already contains change set ${current.fallbackWritten?.id ?? current.fallbackRecovered?.ids.join(", ")}; adopting it`,
+          );
+          current.db = parseDocument(latest.json, backend);
+          current.etag = latest.meta.etag;
+          current.baseJson = latest.json;
+          current.pending = current.pending.filter((thunk) => !batch.includes(thunk));
+          current.dirty = current.pending.length > 0;
+          current.lastWriteAt = new Date().toISOString();
+          current.lastError = null;
+          recordWrite(current, { attempts: 1, contended: false });
+          await resolvePendingRecords(current, backend, { recoveredStored: true });
+          return;
+        }
         if (latest) {
           console.info(`[ai-radar] ${backend.label} changed since it was read; rebasing ${batch.length} local change(s)`);
-          current.db = replay(parseDocument(latest.json, backend), batch);
+          // Replay the *live* queue, not just the snapshot: a mutation that
+          // arrived while this flush was waiting may already have been applied
+          // to the document that is about to be replaced, and must survive too.
+          current.db = replay(parseDocument(latest.json, backend), current.pending.slice());
           current.etag = latest.meta.etag;
+          current.baseJson = latest.json;
         } else {
           current.etag = null; // document removed: (re)create it
+          current.baseJson = null;
         }
-      } else if (remote && current.etag === null) {
-        current.etag = remote.etag;
       }
 
       current.db.updatedAt = new Date().toISOString();
-      const written = await backend.write(JSON.stringify(current.db), { expectedEtag: current.etag });
+      const json = JSON.stringify(current.db);
+      const written = await backend.write(json, { expectedEtag: current.etag });
 
       current.etag = written.meta.etag;
+      current.baseJson = json;
       current.pending = current.pending.filter((thunk) => !batch.includes(thunk));
       current.dirty = current.pending.length > 0;
       current.lastWriteAt = new Date().toISOString();
       current.lastError = null;
+      recordWrite(current, { attempts: attemptsUsed, contended });
+      // The batch is stored, so a record we kept as a safety net is obsolete. A
+      // change set recovered at hydrate is only obsolete if this write actually
+      // contained it — a rebase replaced our document with the remote one.
+      await resolvePendingRecords(current, backend, { recoveredStored: !rebase });
       return;
     } catch (error) {
-      if (error instanceof StorageConflictError) {
+      const conflict = error instanceof StorageConflictError;
+      if (conflict) {
         // Somebody wrote between our `stat` and our write: re-read and retry.
         rebase = true;
-        continue;
+        contended = true;
+        current.metrics.conflicts += 1;
+      } else {
+        current.lastError = errorMessage(error);
       }
-      current.lastError = errorMessage(error);
-      if (attempt < WRITE_ATTEMPTS) {
-        await delay(WRITE_RETRY_DELAY_MS);
-        continue;
+      lastConflict = conflict;
+
+      const wait = backoffDelayMs(attempt, policy);
+      const spent = Date.now() - startedAt;
+      if (attempt >= policy.attempts || spent + wait > policy.deadlineMs) {
+        console.warn(`[ai-radar] giving up on ${backend.label} after ${attempt} attempt(s), ${spent}ms spent`);
+        break;
       }
-      console.error(`[ai-radar] failed to persist ${backend.label}: ${current.lastError}`);
+      await delay(wait);
     }
   }
 
   current.dirty = current.pending.length > 0;
-  if (current.dirty && !current.lastError) {
-    console.warn(`[ai-radar] gave up persisting ${backend.label} after ${WRITE_ATTEMPTS} attempts of contention; changes stay in memory for the next write`);
+  current.metrics.giveUps += 1;
+  current.metrics.lastGiveUpAt = new Date().toISOString();
+  current.metrics.contentionRetries += Math.max(0, attemptsUsed - 1);
+  current.metrics.maxAttemptsUsed = Math.max(current.metrics.maxAttemptsUsed, attemptsUsed);
+  if (current.pending.length === 0) return;
+
+  const reason = lastConflict
+    ? `contention: all ${attemptsUsed} conditional write attempt(s) lost a race against another writer`
+    : `storage error after ${attemptsUsed} attempt(s): ${current.lastError}`;
+  const location = await preservePendingChanges(current, backend, { reason, attempts: attemptsUsed, batch });
+  // Reported through `lastError` as well, so `/api/health` shows the give-up
+  // instead of the changes quietly disappearing from the deployment.
+  current.lastError = location
+    ? `could not persist ${current.pending.length} change(s) to ${backend.label} (${reason}); kept durably at ${location}`
+    : `could not persist ${current.pending.length} change(s) to ${backend.label} (${reason}); the durable fallback failed too — data is in this process's memory only`;
+  console.error(`[ai-radar] ${current.lastError}`);
+}
+
+/**
+ * Durable last resort: keep a change set that could not be written under its own
+ * key so it survives this process. Repeated give-ups refresh the same record
+ * instead of piling up one per flush.
+ */
+async function preservePendingChanges(
+  current: StoreState,
+  backend: StorageBackend,
+  input: { reason: string; attempts: number; batch: MutationThunk[] },
+  round = 0,
+): Promise<string | null> {
+  const existing = current.fallbackWritten;
+  const id = existing?.id ?? createPendingRecordId();
+  const document = JSON.stringify(current.db);
+  // The document includes every change applied so far; `batch` is what this
+  // flush was responsible for. Record both so a later process can tell whether
+  // the pending queue has moved past this record.
+  const covered = Math.max(input.batch.length, current.pending.length);
+  const record: PendingWriteRecord = {
+    id,
+    createdAt: new Date().toISOString(),
+    label: backend.label,
+    reason: input.reason,
+    attempts: input.attempts,
+    baseEtag: current.etag,
+    base: current.baseJson,
+    document,
+    changes: covered,
+  };
+
+  try {
+    const location = await backend.writePending(record);
+    current.fallbackWritten = { id, document, changes: covered };
+    current.metrics.fallbacksWritten += 1;
+    console.info(
+      `[ai-radar] kept ${input.batch.length} change(s) for ${backend.label} in durable pending storage at ${location}`,
+    );
+    // Writing the record is a network round trip on Blob, so a change may have
+    // arrived meanwhile; it is not in the payload we just stored. Refresh the
+    // same record until it covers the queue (bounded, so a pathologically busy
+    // instance cannot spin here).
+    if (current.pending.length > covered) {
+      if (round >= 2) {
+        console.warn(
+          `[ai-radar] pending changes for ${backend.label} keep arriving while they are being persisted; ` +
+            `the current record is one change set behind and the remaining changes stay in memory`,
+        );
+        return location;
+      }
+      return preservePendingChanges(current, backend, input, round + 1);
+    }
+    return location;
+  } catch (error) {
+    console.error(`[ai-radar] durable pending storage failed for ${backend.label}: ${errorMessage(error)}`);
+    return null;
   }
+}
+
+function recordWrite(current: StoreState, result: { attempts: number; contended: boolean }): void {
+  current.metrics.writes += 1;
+  current.metrics.maxAttemptsUsed = Math.max(current.metrics.maxAttemptsUsed, result.attempts);
+  if (result.contended || result.attempts > 1) {
+    current.metrics.contended += 1;
+    current.metrics.contentionRetries += Math.max(0, result.attempts - 1);
+    console.warn(`[ai-radar] persisted the store after ${result.attempts} attempts (write contention)`);
+  }
+}
+
+/** Clear durable records whose changes are known to be in the stored document. */
+async function resolvePendingRecords(
+  current: StoreState,
+  backend: StorageBackend,
+  options: { recoveredStored: boolean },
+): Promise<void> {
+  const written = current.fallbackWritten;
+  current.fallbackWritten = null;
+  if (written) await clearPendingRecord(backend, written.id);
+
+  const recovered = current.fallbackRecovered;
+  current.fallbackRecovered = null;
+  if (!recovered) return;
+
+  if (options.recoveredStored) {
+    for (const id of recovered.ids) await clearPendingRecord(backend, id);
+    current.metrics.fallbacksRecovered += recovered.ids.length;
+    console.info(`[ai-radar] recovered change set(s) ${recovered.ids.join(", ")} are now stored in ${backend.label}`);
+    return;
+  }
+  // A rebase replaced the merged document with the remote one: the records must
+  // stay so the changes are not lost.
+  console.warn(
+    `[ai-radar] recovered change set(s) ${recovered.ids.join(", ")} were superseded by a concurrent write; ` +
+      `they stay in ${backend.label} pending storage`,
+  );
+}
+
+async function clearPendingRecord(backend: StorageBackend, id: string): Promise<void> {
+  try {
+    await backend.resolvePending(id);
+  } catch (error) {
+    console.warn(`[ai-radar] could not clear pending record ${id} of ${backend.label}: ${errorMessage(error)}`);
+  }
+}
+
+/**
+ * Merge change sets that an earlier process could not write back into the
+ * document (three-way merge against the stored version, see `./storage/merge`)
+ * and let the next flush store the result. Nothing is dropped when a merge is
+ * impossible: those records stay durable and are retried by the next hydrate.
+ */
+async function recoverPendingWrites(
+  current: StoreState,
+  backend: StorageBackend,
+  remoteJson: string | null,
+): Promise<void> {
+  let records: PendingWriteRecord[];
+  try {
+    records = await backend.listPending();
+  } catch (error) {
+    console.warn(`[ai-radar] could not list pending changes of ${backend.label}: ${errorMessage(error)}`);
+    return;
+  }
+  current.metrics.pendingFallbacks = records.length;
+  if (records.length === 0) return;
+
+  // Oldest first, so the most recent change set wins where two touch the same
+  // field — the same order in which they were made.
+  const ordered = [...records].sort((a, b) => a.id.localeCompare(b.id));
+  const applied: string[] = [];
+  let merged = remoteJson;
+
+  for (const record of ordered) {
+    const next = mergePendingDocument(record.base, record.document, merged);
+    if (next === null) {
+      console.warn(`[ai-radar] pending change set ${record.id} of ${backend.label} could not be merged; kept for later`);
+      continue;
+    }
+    merged = next;
+    applied.push(record.id);
+  }
+
+  if (merged === null || applied.length === 0) return;
+
+  current.db = parseDocument(merged, backend);
+  current.baseJson = remoteJson;
+  current.dirty = true;
+  // A fresh state has nothing pending, so the merged document covers 0 changes
+  // of its own — it must never be used to drop a later pending change.
+  current.fallbackRecovered = { ids: applied, document: merged, changes: 0 };
+  console.warn(
+    `[ai-radar] recovered ${applied.length} unpersisted change set(s) from ${backend.label} pending storage; ` +
+      `they will be written back on the next flush`,
+  );
+  // Do not wait for a user request: a recovered change set that is never written
+  // back is still a pending write.
+  scheduleFlush();
 }
 
 

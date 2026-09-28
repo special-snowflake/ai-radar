@@ -213,6 +213,7 @@ describe("storage backend resolution", () => {
       pathname: "news.json",
       access: "private",
       explicitToken: true,
+      pendingKeyPattern: "news.pending-*.json",
     });
     assert.ok(!JSON.stringify(backend.describe()).includes("super-secret"));
   });
